@@ -90,6 +90,7 @@ def _class_name(boxes_key: str, class_id: int, custom: list) -> str:
 class CameraWorker(QThread):
     frame_ready = pyqtSignal(QImage, dict)   # (decoded image, raw data dict)
     fps_update  = pyqtSignal(float)
+    status      = pyqtSignal(str)
     error       = pyqtSignal(str)
 
     _CMD_INVOKE = b"AT+INVOKE=-1,0,0\r"
@@ -121,10 +122,39 @@ class CameraWorker(QThread):
             self.error.emit(str(exc))
             return
 
+        self._running = True
+
+        # On Windows, opening the serial port asserts DTR which resets the device.
+        # Ping AT+ID? until the device responds before sending AT+INVOKE.
+        self.status.emit("Waiting for device…")
+        ready = False
+        for _ in range(15):
+            if not self._running:
+                break
+            self._ser.reset_input_buffer()
+            self._ser.write(b"AT+ID?\r")
+            self._ser.flush()
+            time.sleep(0.5)
+            resp = self._ser.read(self._ser.in_waiting or 0)
+            if b'"ID?"' in resp or b'"name"' in resp:
+                ready = True
+                break
+
+        if not ready or not self._running:
+            if self._ser and self._ser.is_open:
+                try:
+                    self._ser.close()
+                except Exception:
+                    pass
+            if self._running:
+                self.error.emit("Device did not respond to AT+ID? (check connection)")
+            return
+
+        self.status.emit("Device ready — starting inference…")
+        self._ser.reset_input_buffer()
         self._ser.write(self._CMD_INVOKE)
         self._ser.flush()
 
-        self._running = True
         buf = bytearray()
         in_json = False
         t_prev = time.perf_counter()
@@ -599,10 +629,11 @@ class MainWindow(QMainWindow):
         self._worker = CameraWorker(port, baud)
         self._worker.frame_ready.connect(self._on_frame)
         self._worker.fps_update.connect(self.ctrl.update_fps)
+        self._worker.status.connect(self.status.showMessage)
         self._worker.error.connect(self._on_error)
         self._worker.start()
         self.ctrl.set_connected(True)
-        self.status.showMessage(f"Connected — {port} @ {baud}  |  AT+INVOKE=-1,0,0")
+        self.status.showMessage(f"Connecting — {port} @ {baud}…")
 
     def _stop(self):
         if self._worker:
