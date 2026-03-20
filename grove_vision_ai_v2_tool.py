@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import threading
 import time
+import json
+import base64
 from pathlib import Path
 
 import serial
@@ -714,59 +716,93 @@ class SerialMonitorTab(QWidget):
 
 class CameraWorker(QThread):
     """
-    Reads raw bytes from the device's serial port, locates JPEG frames by
-    their SOI (0xFF 0xD8) / EOI (0xFF 0xD9) markers, and emits each frame
-    as a QImage decoded natively by Qt — no OpenCV required.
-    """
-    frame_ready = pyqtSignal(QImage)
-    fps_update  = pyqtSignal(float)
-    error       = pyqtSignal(str)
+    Grove Vision AI V2 camera protocol:
+      1. Send  AT+INVOKE=-1,0,0\\r  → starts continuous inference
+      2. Device replies with JSON frames delimited by \\r{ ... }\\n
+      3. Each frame contains data.image = base64-encoded JPEG
+      4. Send  AT+BREAK\\r  to stop
 
-    _SOI = b'\xff\xd8'
-    _EOI = b'\xff\xd9'
-    _BUF_LIMIT = 2 * 1024 * 1024  # 2 MB — discard if no frame found
+    JSON frame format:
+      {"type":1,"name":"INVOKE","code":0,
+       "data":{"image":"<b64>","boxes":[...],"perf":[...],...}}
+    """
+    frame_ready  = pyqtSignal(QImage)
+    fps_update   = pyqtSignal(float)
+    info_update  = pyqtSignal(str)   # detection info string
+    error        = pyqtSignal(str)
+
+    _CMD_INVOKE = b"AT+INVOKE=-1,0,0\r"
+    _CMD_BREAK  = b"AT+BREAK\r"
 
     def __init__(self, port: str, baudrate: int):
         super().__init__()
         self.port = port
         self.baudrate = baudrate
         self._running = False
+        self._ser = None
 
     def run(self):
         try:
-            ser = serial.Serial(self.port, self.baudrate, timeout=0.05)
+            self._ser = serial.Serial(self.port, self.baudrate, timeout=0.05)
         except serial.SerialException as exc:
             self.error.emit(str(exc))
             return
+
+        # Start continuous inference
+        self._ser.write(self._CMD_INVOKE)
+        self._ser.flush()
 
         self._running = True
         buf = bytearray()
         t_prev = time.perf_counter()
         fps_acc, fps_n = 0.0, 0
+        in_json = False
 
         while self._running:
-            chunk = ser.read(ser.in_waiting or 1)
+            chunk = self._ser.read(self._ser.in_waiting or 1)
             if chunk:
                 buf.extend(chunk)
 
-            # Extract every complete JPEG frame sitting in the buffer
+            # Parse JSON frames: start = \r{ (0x0D 0x7B), end = }\n (0x7D 0x0A)
             while True:
-                soi = buf.find(self._SOI)
-                if soi == -1:
-                    buf.clear()
-                    break
-                # Discard garbage before SOI
-                if soi > 0:
-                    del buf[:soi]
-                eoi = buf.find(self._EOI, 2)
-                if eoi == -1:
-                    break  # frame not complete yet
-                jpg_bytes = bytes(buf[:eoi + 2])
-                del buf[:eoi + 2]
+                if not in_json:
+                    idx = buf.find(b"\r{")
+                    if idx == -1:
+                        # Keep last byte in case it's an incomplete \r
+                        if buf:
+                            buf = buf[-1:]
+                        break
+                    del buf[:idx + 1]  # keep '{' as start
+                    in_json = True
+
+                # We're inside a JSON frame — look for closing }\n
+                end = buf.find(b"}\n")
+                if end == -1:
+                    break  # wait for more data
+
+                json_bytes = bytes(buf[:end + 1])  # include '}'
+                del buf[:end + 2]                  # consume '}\n'
+                in_json = False
+
+                try:
+                    obj = json.loads(json_bytes)
+                except json.JSONDecodeError:
+                    continue
+
+                data = obj.get("data", {})
+                b64 = data.get("image")
+                if not b64:
+                    continue
+
+                try:
+                    jpg_bytes = base64.b64decode(b64)
+                except Exception:
+                    continue
 
                 img = QImage()
                 if img.loadFromData(jpg_bytes, "JPEG") and not img.isNull():
                     self.frame_ready.emit(img)
+
                     t_now = time.perf_counter()
                     fps_acc += 1.0 / max(t_now - t_prev, 1e-6)
                     fps_n += 1
@@ -775,11 +811,28 @@ class CameraWorker(QThread):
                         self.fps_update.emit(fps_acc / fps_n)
                         fps_acc, fps_n = 0.0, 0
 
-            # Safety valve — drop buffer if it grows huge with no valid frame
-            if len(buf) > self._BUF_LIMIT:
-                buf.clear()
+                    # Emit detection info if present
+                    info_parts = []
+                    perf = data.get("perf")
+                    if perf and len(perf) >= 3:
+                        info_parts.append(f"pre {perf[0]}ms  infer {perf[1]}ms  post {perf[2]}ms")
+                    boxes = data.get("boxes") or data.get("peoplenet_boxes") or []
+                    if boxes:
+                        info_parts.append(f"{len(boxes)} box(es)")
+                    classes = data.get("classes", [])
+                    if classes:
+                        info_parts.append(f"cls {classes}")
+                    if info_parts:
+                        self.info_update.emit("  |  ".join(info_parts))
 
-        ser.close()
+        # Stop inference
+        if self._ser and self._ser.is_open:
+            try:
+                self._ser.write(self._CMD_BREAK)
+                self._ser.flush()
+            except Exception:
+                pass
+            self._ser.close()
 
     def stop(self):
         self._running = False
@@ -848,6 +901,12 @@ class CameraTab(QWidget):
 
         root.addLayout(ctrl)
 
+        # ── Detection info bar ─────────────────────────────────────────────
+        self.info_lbl = QLabel("")
+        self.info_lbl.setFont(QFont("Consolas", 8))
+        self.info_lbl.setStyleSheet("color: #a8c6a8;")
+        root.addWidget(self.info_lbl)
+
         # ── Video display ──────────────────────────────────────────────────
         self.view = QLabel()
         self.view.setAlignment(Qt.AlignCenter)
@@ -893,11 +952,12 @@ class CameraTab(QWidget):
             self.log_message.emit("[Camera] ERROR: No serial port selected.")
             return
         self._save_settings()
-        self.log_message.emit(f"[Camera] Connecting to {port} @ {baud} — waiting for JPEG stream…")
+        self.log_message.emit(f"[Camera] {port} @ {baud} — sending AT+INVOKE=-1,0,0…")
 
         self._worker = CameraWorker(port, baud)
         self._worker.frame_ready.connect(self._on_frame)
         self._worker.fps_update.connect(self._on_fps)
+        self._worker.info_update.connect(self._on_info)
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
@@ -918,6 +978,7 @@ class CameraTab(QWidget):
         self.baud_combo.setEnabled(True)
         self.fps_lbl.setText("FPS: —")
         self.res_lbl.setText("")
+        self.info_lbl.setText("")
         self.view.setPixmap(QPixmap())
         self.view.setText("Select the device COM port and press Start")
         self.log_message.emit("[Camera] Disconnected.")
@@ -932,6 +993,9 @@ class CameraTab(QWidget):
 
     def _on_fps(self, fps: float):
         self.fps_lbl.setText(f"FPS: {fps:.1f}")
+
+    def _on_info(self, info: str):
+        self.info_lbl.setText(info)
 
     def _on_error(self, msg: str):
         self._stop_camera()
