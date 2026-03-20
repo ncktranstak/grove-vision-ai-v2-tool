@@ -3,18 +3,20 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 
+import cv2
 import serial
 import serial.tools.list_ports
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QLabel, QLineEdit, QPushButton, QComboBox, QFileDialog,
     QTextEdit, QGroupBox, QFormLayout, QProgressBar, QSizePolicy,
-    QSplitter, QCheckBox, QStatusBar
+    QSplitter, QCheckBox, QStatusBar, QSpinBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSettings, QTimer
-from PyQt5.QtGui import QFont, QPalette, QColor, QTextCursor
+from PyQt5.QtGui import QFont, QPalette, QColor, QTextCursor, QImage, QPixmap
 
 # ---------------------------------------------------------------------------
 # Shared worker thread base
@@ -708,6 +710,246 @@ class SerialMonitorTab(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Tab 5 – Camera View
+# ---------------------------------------------------------------------------
+
+class CameraWorker(QThread):
+    frame_ready = pyqtSignal(QImage)
+    fps_update  = pyqtSignal(float)
+    error       = pyqtSignal(str)
+
+    def __init__(self, cam_index: int, width: int, height: int):
+        super().__init__()
+        self.cam_index = cam_index
+        self.width = width
+        self.height = height
+        self._running = False
+
+    def run(self):
+        cap = cv2.VideoCapture(self.cam_index, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            self.error.emit(f"Cannot open camera index {self.cam_index}")
+            return
+
+        if self.width > 0 and self.height > 0:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+
+        self._running = True
+        t_prev = time.perf_counter()
+        fps_acc, fps_n = 0.0, 0
+
+        while self._running:
+            ret, frame = cap.read()
+            if not ret:
+                self.error.emit("Frame read failed — device disconnected?")
+                break
+
+            # BGR → RGB
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb.shape
+            img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
+            self.frame_ready.emit(img)
+
+            t_now = time.perf_counter()
+            fps_acc += 1.0 / max(t_now - t_prev, 1e-6)
+            fps_n += 1
+            t_prev = t_now
+            if fps_n >= 15:
+                self.fps_update.emit(fps_acc / fps_n)
+                fps_acc, fps_n = 0.0, 0
+
+        cap.release()
+
+    def stop(self):
+        self._running = False
+        self.wait(2000)
+
+
+class CameraTab(QWidget):
+    log_message = pyqtSignal(str)
+
+    # Common resolutions to offer in the dropdown
+    RESOLUTIONS = [
+        ("Default", 0, 0),
+        ("160×120",   160,  120),
+        ("320×240",   320,  240),
+        ("640×480",   640,  480),
+        ("800×600",   800,  600),
+        ("1280×720",  1280, 720),
+        ("1920×1080", 1920, 1080),
+    ]
+
+    def __init__(self, settings: QSettings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self._worker: CameraWorker | None = None
+        self._last_frame: QImage | None = None
+        self._setup_ui()
+        self._load_settings()
+
+    def _setup_ui(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(6)
+
+        # ── Control bar ────────────────────────────────────────────────────
+        ctrl = QHBoxLayout()
+
+        ctrl.addWidget(QLabel("Camera:"))
+        self.cam_combo = QComboBox()
+        self.cam_combo.setMinimumWidth(90)
+        self._scan_cameras()
+        ctrl.addWidget(self.cam_combo)
+
+        scan_btn = QPushButton("⟳")
+        scan_btn.setFixedWidth(30)
+        scan_btn.setToolTip("Rescan cameras")
+        scan_btn.clicked.connect(self._scan_cameras)
+        ctrl.addWidget(scan_btn)
+
+        ctrl.addWidget(QLabel("Resolution:"))
+        self.res_combo = QComboBox()
+        for label, *_ in self.RESOLUTIONS:
+            self.res_combo.addItem(label)
+        ctrl.addWidget(self.res_combo)
+
+        self.start_btn = QPushButton("Start")
+        self.start_btn.setFixedWidth(80)
+        self.start_btn.setStyleSheet("background-color: #2d6a4f; color: white;")
+        self.start_btn.clicked.connect(self._toggle_camera)
+        ctrl.addWidget(self.start_btn)
+
+        self.snap_btn = QPushButton("Snapshot")
+        self.snap_btn.setFixedWidth(90)
+        self.snap_btn.setEnabled(False)
+        self.snap_btn.clicked.connect(self._save_snapshot)
+        ctrl.addWidget(self.snap_btn)
+
+        ctrl.addStretch()
+
+        self.fps_lbl = QLabel("FPS: —")
+        self.fps_lbl.setStyleSheet("color: #6ec6ff;")
+        ctrl.addWidget(self.fps_lbl)
+
+        self.res_lbl = QLabel("")
+        self.res_lbl.setStyleSheet("color: #888;")
+        ctrl.addWidget(self.res_lbl)
+
+        root.addLayout(ctrl)
+
+        # ── Video display ──────────────────────────────────────────────────
+        self.view = QLabel()
+        self.view.setAlignment(Qt.AlignCenter)
+        self.view.setStyleSheet("background-color: #111; border: 1px solid #444;")
+        self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.view.setText("No camera — press Start")
+        self.view.setFont(QFont("Consolas", 10))
+        root.addWidget(self.view, stretch=1)
+
+    def _load_settings(self):
+        saved_idx = self.settings.value("camera/index", "0")
+        ci = self.cam_combo.findText(saved_idx)
+        if ci >= 0:
+            self.cam_combo.setCurrentIndex(ci)
+        saved_res = self.settings.value("camera/resolution", "Default")
+        ri = self.res_combo.findText(saved_res)
+        if ri >= 0:
+            self.res_combo.setCurrentIndex(ri)
+
+    def _save_settings(self):
+        self.settings.setValue("camera/index", self.cam_combo.currentText())
+        self.settings.setValue("camera/resolution", self.res_combo.currentText())
+
+    def _scan_cameras(self):
+        current = self.cam_combo.currentText()
+        self.cam_combo.clear()
+        found = []
+        for i in range(8):
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+            if cap.isOpened():
+                found.append(str(i))
+                cap.release()
+        if not found:
+            found = ["0"]
+        self.cam_combo.addItems(found)
+        idx = self.cam_combo.findText(current)
+        if idx >= 0:
+            self.cam_combo.setCurrentIndex(idx)
+
+    def _toggle_camera(self):
+        if self._worker and self._worker.isRunning():
+            self._stop_camera()
+        else:
+            self._start_camera()
+
+    def _start_camera(self):
+        cam_idx = int(self.cam_combo.currentText())
+        res_label = self.res_combo.currentText()
+        _, w, h = next(
+            (r for r in self.RESOLUTIONS if r[0] == res_label),
+            ("Default", 0, 0)
+        )
+        self._save_settings()
+        self.log_message.emit(f"[Camera] Opening index {cam_idx}  resolution {res_label}")
+
+        self._worker = CameraWorker(cam_idx, w, h)
+        self._worker.frame_ready.connect(self._on_frame)
+        self._worker.fps_update.connect(self._on_fps)
+        self._worker.error.connect(self._on_error)
+        self._worker.start()
+
+        self.start_btn.setText("Stop")
+        self.start_btn.setStyleSheet("background-color: #d62828; color: white;")
+        self.snap_btn.setEnabled(True)
+        self.cam_combo.setEnabled(False)
+        self.res_combo.setEnabled(False)
+
+    def _stop_camera(self):
+        if self._worker:
+            self._worker.stop()
+            self._worker = None
+        self.start_btn.setText("Start")
+        self.start_btn.setStyleSheet("background-color: #2d6a4f; color: white;")
+        self.snap_btn.setEnabled(False)
+        self.cam_combo.setEnabled(True)
+        self.res_combo.setEnabled(True)
+        self.fps_lbl.setText("FPS: —")
+        self.res_lbl.setText("")
+        self.view.setText("No camera — press Start")
+        self.log_message.emit("[Camera] Stopped.")
+
+    def _on_frame(self, img: QImage):
+        self._last_frame = img
+        w = self.view.width()
+        h = self.view.height()
+        pix = QPixmap.fromImage(img).scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.view.setPixmap(pix)
+        self.res_lbl.setText(f"{img.width()}×{img.height()}")
+
+    def _on_fps(self, fps: float):
+        self.fps_lbl.setText(f"FPS: {fps:.1f}")
+
+    def _on_error(self, msg: str):
+        self._stop_camera()
+        self.log_message.emit(f"[Camera] ERROR: {msg}")
+
+    def _save_snapshot(self):
+        if not self._last_frame:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save snapshot", "snapshot.png",
+            "PNG (*.png);;JPEG (*.jpg *.jpeg)"
+        )
+        if path:
+            self._last_frame.save(path)
+            self.log_message.emit(f"[Camera] Snapshot saved → {path}")
+
+    def cleanup(self):
+        if self._worker and self._worker.isRunning():
+            self._worker.stop()
+
+
+# ---------------------------------------------------------------------------
 # Main Window
 # ---------------------------------------------------------------------------
 
@@ -759,11 +1001,13 @@ class MainWindow(QMainWindow):
         self.gen_tab = GenerateTab(self.settings)
         self.flash_tab = FlashTab(self.settings)
         self.serial_tab = SerialMonitorTab(self.settings)
+        self.camera_tab = CameraTab(self.settings)
 
         self.tabs.addTab(self.build_tab,  "Build Firmware")
         self.tabs.addTab(self.gen_tab,    "Generate Image")
         self.tabs.addTab(self.flash_tab,  "Flash Firmware")
         self.tabs.addTab(self.serial_tab, "Serial Monitor")
+        self.tabs.addTab(self.camera_tab, "Camera View")
 
         splitter.addWidget(self.tabs)
 
@@ -796,7 +1040,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(splitter)
 
         # Wire all tabs' log signals
-        for tab in (self.build_tab, self.gen_tab, self.flash_tab, self.serial_tab):
+        for tab in (self.build_tab, self.gen_tab, self.flash_tab, self.serial_tab, self.camera_tab):
             tab.log_message.connect(self._append_log)
 
         # Status bar
@@ -817,6 +1061,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.settings.setValue("window/geometry", self.saveGeometry())
         self.serial_tab.cleanup()
+        self.camera_tab.cleanup()
         super().closeEvent(event)
 
 
