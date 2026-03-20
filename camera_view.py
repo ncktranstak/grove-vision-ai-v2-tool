@@ -23,7 +23,7 @@ import serial.tools.list_ports
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QGroupBox, QDoubleSpinBox,
-    QSizePolicy, QFileDialog, QSplitter, QStatusBar, QFrame
+    QSizePolicy, QFileDialog, QSplitter, QStatusBar, QFrame, QLineEdit
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSettings, QRect, QPoint
 from PyQt5.QtGui import (
@@ -261,12 +261,13 @@ class VideoCanvas(QWidget):
         pix.fill(Qt.black)
 
         p = QPainter(pix)
-        # Draw base image scaled up
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        # Draw base image scaled up with smooth interpolation
         p.drawImage(QRect(0, 0, draw_w, draw_h), img)
 
         # Draw all box types
         for key in ("boxes", "peoplenet_boxes", "fm_face_boxes",
-                    "gender_cls_boxes", "keypoints"):
+                    "gender_cls_boxes", "gesture_boxes", "keypoints"):
             raw = data.get(key)
             if not raw:
                 continue
@@ -366,6 +367,7 @@ class ControlPanel(QWidget):
     disconnect_requested = pyqtSignal()
     score_changed        = pyqtSignal(float)
     iou_changed          = pyqtSignal(float)
+    classes_changed      = pyqtSignal(list)
     snapshot_requested   = pyqtSignal()
 
     BAUDRATES = ["115200", "230400", "460800", "921600"]
@@ -461,6 +463,17 @@ class ControlPanel(QWidget):
         iou_row.addWidget(self.iou_spin)
         inf_lay.addLayout(iou_row)
 
+        cls_lbl = QLabel("Classes (CSV):")
+        cls_lbl.setToolTip(
+            "Comma-separated class names that override the built-in labels.\n"
+            "Example for hand gesture:  rock, paper, scissors, ok, thumbsup"
+        )
+        inf_lay.addWidget(cls_lbl)
+        self.classes_edit = QLineEdit()
+        self.classes_edit.setPlaceholderText("e.g.  rock, paper, scissors")
+        self.classes_edit.textChanged.connect(self._on_classes_changed)
+        inf_lay.addWidget(self.classes_edit)
+
         root.addWidget(inf_grp)
 
         # ── Actions ─────────────────────────────────────────────────────
@@ -502,12 +515,18 @@ class ControlPanel(QWidget):
             self.baud_combo.setCurrentIndex(bi)
         self.score_spin.setValue(float(self.settings.value("camview/score", 0.50)))
         self.iou_spin.setValue(float(self.settings.value("camview/iou", 0.45)))
+        self.classes_edit.setText(self.settings.value("camview/classes", ""))
 
     def save_settings(self):
-        self.settings.setValue("camview/port",  self.port_combo.currentText())
-        self.settings.setValue("camview/baud",  self.baud_combo.currentText())
-        self.settings.setValue("camview/score", self.score_spin.value())
-        self.settings.setValue("camview/iou",   self.iou_spin.value())
+        self.settings.setValue("camview/port",    self.port_combo.currentText())
+        self.settings.setValue("camview/baud",    self.baud_combo.currentText())
+        self.settings.setValue("camview/score",   self.score_spin.value())
+        self.settings.setValue("camview/iou",     self.iou_spin.value())
+        self.settings.setValue("camview/classes", self.classes_edit.text())
+
+    def _on_classes_changed(self, text: str):
+        names = [n.strip() for n in text.split(",") if n.strip()]
+        self.classes_changed.emit(names)
 
     def _refresh_ports(self):
         current = self.port_combo.currentText()
@@ -610,12 +629,16 @@ class MainWindow(QMainWindow):
         self.ctrl.disconnect_requested.connect(self._stop)
         self.ctrl.score_changed.connect(self._on_score_changed)
         self.ctrl.iou_changed.connect(self._on_iou_changed)
+        self.ctrl.classes_changed.connect(self._on_classes_changed)
         self.ctrl.snapshot_requested.connect(self._snapshot)
         layout.addWidget(self.ctrl)
 
         # Right: video canvas
         self.canvas = VideoCanvas()
         self.canvas.score_thresh = self.ctrl.score_value
+        # Apply any saved custom class names (signal fires before connection above)
+        saved_cls = [n.strip() for n in self.ctrl.classes_edit.text().split(",") if n.strip()]
+        self.canvas.custom_classes = saved_cls
         layout.addWidget(self.canvas, stretch=1)
 
         # Status bar
@@ -666,6 +689,9 @@ class MainWindow(QMainWindow):
         if self._worker:
             cmd = f"AT+TIOU={v:.2f}\r".encode()
             self._worker.send_raw(cmd)
+
+    def _on_classes_changed(self, names: list):
+        self.canvas.custom_classes = names
 
     # ── snapshot ────────────────────────────────────────────────────────
 
