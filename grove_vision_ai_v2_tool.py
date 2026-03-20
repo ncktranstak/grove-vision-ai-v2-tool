@@ -6,7 +6,6 @@ import threading
 import time
 from pathlib import Path
 
-import cv2
 import serial
 import serial.tools.list_ports
 from PyQt5.QtWidgets import (
@@ -710,75 +709,87 @@ class SerialMonitorTab(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Tab 5 – Camera View
+# Tab 5 – Camera View  (serial JPEG stream from Grove Vision AI V2)
 # ---------------------------------------------------------------------------
 
 class CameraWorker(QThread):
+    """
+    Reads raw bytes from the device's serial port, locates JPEG frames by
+    their SOI (0xFF 0xD8) / EOI (0xFF 0xD9) markers, and emits each frame
+    as a QImage decoded natively by Qt — no OpenCV required.
+    """
     frame_ready = pyqtSignal(QImage)
     fps_update  = pyqtSignal(float)
     error       = pyqtSignal(str)
 
-    def __init__(self, cam_index: int, width: int, height: int):
+    _SOI = b'\xff\xd8'
+    _EOI = b'\xff\xd9'
+    _BUF_LIMIT = 2 * 1024 * 1024  # 2 MB — discard if no frame found
+
+    def __init__(self, port: str, baudrate: int):
         super().__init__()
-        self.cam_index = cam_index
-        self.width = width
-        self.height = height
+        self.port = port
+        self.baudrate = baudrate
         self._running = False
 
     def run(self):
-        cap = cv2.VideoCapture(self.cam_index, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            self.error.emit(f"Cannot open camera index {self.cam_index}")
+        try:
+            ser = serial.Serial(self.port, self.baudrate, timeout=0.05)
+        except serial.SerialException as exc:
+            self.error.emit(str(exc))
             return
 
-        if self.width > 0 and self.height > 0:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-
         self._running = True
+        buf = bytearray()
         t_prev = time.perf_counter()
         fps_acc, fps_n = 0.0, 0
 
         while self._running:
-            ret, frame = cap.read()
-            if not ret:
-                self.error.emit("Frame read failed — device disconnected?")
-                break
+            chunk = ser.read(ser.in_waiting or 1)
+            if chunk:
+                buf.extend(chunk)
 
-            # BGR → RGB
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb.shape
-            img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
-            self.frame_ready.emit(img)
+            # Extract every complete JPEG frame sitting in the buffer
+            while True:
+                soi = buf.find(self._SOI)
+                if soi == -1:
+                    buf.clear()
+                    break
+                # Discard garbage before SOI
+                if soi > 0:
+                    del buf[:soi]
+                eoi = buf.find(self._EOI, 2)
+                if eoi == -1:
+                    break  # frame not complete yet
+                jpg_bytes = bytes(buf[:eoi + 2])
+                del buf[:eoi + 2]
 
-            t_now = time.perf_counter()
-            fps_acc += 1.0 / max(t_now - t_prev, 1e-6)
-            fps_n += 1
-            t_prev = t_now
-            if fps_n >= 15:
-                self.fps_update.emit(fps_acc / fps_n)
-                fps_acc, fps_n = 0.0, 0
+                img = QImage()
+                if img.loadFromData(jpg_bytes, "JPEG") and not img.isNull():
+                    self.frame_ready.emit(img)
+                    t_now = time.perf_counter()
+                    fps_acc += 1.0 / max(t_now - t_prev, 1e-6)
+                    fps_n += 1
+                    t_prev = t_now
+                    if fps_n >= 10:
+                        self.fps_update.emit(fps_acc / fps_n)
+                        fps_acc, fps_n = 0.0, 0
 
-        cap.release()
+            # Safety valve — drop buffer if it grows huge with no valid frame
+            if len(buf) > self._BUF_LIMIT:
+                buf.clear()
+
+        ser.close()
 
     def stop(self):
         self._running = False
-        self.wait(2000)
+        self.wait(3000)
 
 
 class CameraTab(QWidget):
     log_message = pyqtSignal(str)
 
-    # Common resolutions to offer in the dropdown
-    RESOLUTIONS = [
-        ("Default", 0, 0),
-        ("160×120",   160,  120),
-        ("320×240",   320,  240),
-        ("640×480",   640,  480),
-        ("800×600",   800,  600),
-        ("1280×720",  1280, 720),
-        ("1920×1080", 1920, 1080),
-    ]
+    BAUDRATES = ["115200", "230400", "460800", "921600"]
 
     def __init__(self, settings: QSettings, parent=None):
         super().__init__(parent)
@@ -795,23 +806,23 @@ class CameraTab(QWidget):
         # ── Control bar ────────────────────────────────────────────────────
         ctrl = QHBoxLayout()
 
-        ctrl.addWidget(QLabel("Camera:"))
-        self.cam_combo = QComboBox()
-        self.cam_combo.setMinimumWidth(90)
-        self._scan_cameras()
-        ctrl.addWidget(self.cam_combo)
+        ctrl.addWidget(QLabel("Port:"))
+        self.port_combo = QComboBox()
+        self.port_combo.setMinimumWidth(110)
+        self._refresh_ports()
+        ctrl.addWidget(self.port_combo)
 
-        scan_btn = QPushButton("⟳")
-        scan_btn.setFixedWidth(30)
-        scan_btn.setToolTip("Rescan cameras")
-        scan_btn.clicked.connect(self._scan_cameras)
-        ctrl.addWidget(scan_btn)
+        refresh_btn = QPushButton("⟳")
+        refresh_btn.setFixedWidth(30)
+        refresh_btn.setToolTip("Rescan serial ports")
+        refresh_btn.clicked.connect(self._refresh_ports)
+        ctrl.addWidget(refresh_btn)
 
-        ctrl.addWidget(QLabel("Resolution:"))
-        self.res_combo = QComboBox()
-        for label, *_ in self.RESOLUTIONS:
-            self.res_combo.addItem(label)
-        ctrl.addWidget(self.res_combo)
+        ctrl.addWidget(QLabel("Baud:"))
+        self.baud_combo = QComboBox()
+        self.baud_combo.addItems(self.BAUDRATES)
+        self.baud_combo.setCurrentText("921600")
+        ctrl.addWidget(self.baud_combo)
 
         self.start_btn = QPushButton("Start")
         self.start_btn.setFixedWidth(80)
@@ -842,39 +853,32 @@ class CameraTab(QWidget):
         self.view.setAlignment(Qt.AlignCenter)
         self.view.setStyleSheet("background-color: #111; border: 1px solid #444;")
         self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.view.setText("No camera — press Start")
+        self.view.setText("Select the device COM port and press Start")
         self.view.setFont(QFont("Consolas", 10))
         root.addWidget(self.view, stretch=1)
 
     def _load_settings(self):
-        saved_idx = self.settings.value("camera/index", "0")
-        ci = self.cam_combo.findText(saved_idx)
-        if ci >= 0:
-            self.cam_combo.setCurrentIndex(ci)
-        saved_res = self.settings.value("camera/resolution", "Default")
-        ri = self.res_combo.findText(saved_res)
-        if ri >= 0:
-            self.res_combo.setCurrentIndex(ri)
+        saved_port = self.settings.value("camera/port", "")
+        idx = self.port_combo.findText(saved_port)
+        if idx >= 0:
+            self.port_combo.setCurrentIndex(idx)
+        saved_baud = self.settings.value("camera/baud", "921600")
+        bi = self.baud_combo.findText(saved_baud)
+        if bi >= 0:
+            self.baud_combo.setCurrentIndex(bi)
 
     def _save_settings(self):
-        self.settings.setValue("camera/index", self.cam_combo.currentText())
-        self.settings.setValue("camera/resolution", self.res_combo.currentText())
+        self.settings.setValue("camera/port", self.port_combo.currentText())
+        self.settings.setValue("camera/baud", self.baud_combo.currentText())
 
-    def _scan_cameras(self):
-        current = self.cam_combo.currentText()
-        self.cam_combo.clear()
-        found = []
-        for i in range(8):
-            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-            if cap.isOpened():
-                found.append(str(i))
-                cap.release()
-        if not found:
-            found = ["0"]
-        self.cam_combo.addItems(found)
-        idx = self.cam_combo.findText(current)
+    def _refresh_ports(self):
+        current = self.port_combo.currentText()
+        self.port_combo.clear()
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self.port_combo.addItems(ports)
+        idx = self.port_combo.findText(current)
         if idx >= 0:
-            self.cam_combo.setCurrentIndex(idx)
+            self.port_combo.setCurrentIndex(idx)
 
     def _toggle_camera(self):
         if self._worker and self._worker.isRunning():
@@ -883,16 +887,15 @@ class CameraTab(QWidget):
             self._start_camera()
 
     def _start_camera(self):
-        cam_idx = int(self.cam_combo.currentText())
-        res_label = self.res_combo.currentText()
-        _, w, h = next(
-            (r for r in self.RESOLUTIONS if r[0] == res_label),
-            ("Default", 0, 0)
-        )
+        port = self.port_combo.currentText()
+        baud = int(self.baud_combo.currentText())
+        if not port:
+            self.log_message.emit("[Camera] ERROR: No serial port selected.")
+            return
         self._save_settings()
-        self.log_message.emit(f"[Camera] Opening index {cam_idx}  resolution {res_label}")
+        self.log_message.emit(f"[Camera] Connecting to {port} @ {baud} — waiting for JPEG stream…")
 
-        self._worker = CameraWorker(cam_idx, w, h)
+        self._worker = CameraWorker(port, baud)
         self._worker.frame_ready.connect(self._on_frame)
         self._worker.fps_update.connect(self._on_fps)
         self._worker.error.connect(self._on_error)
@@ -901,8 +904,8 @@ class CameraTab(QWidget):
         self.start_btn.setText("Stop")
         self.start_btn.setStyleSheet("background-color: #d62828; color: white;")
         self.snap_btn.setEnabled(True)
-        self.cam_combo.setEnabled(False)
-        self.res_combo.setEnabled(False)
+        self.port_combo.setEnabled(False)
+        self.baud_combo.setEnabled(False)
 
     def _stop_camera(self):
         if self._worker:
@@ -911,12 +914,13 @@ class CameraTab(QWidget):
         self.start_btn.setText("Start")
         self.start_btn.setStyleSheet("background-color: #2d6a4f; color: white;")
         self.snap_btn.setEnabled(False)
-        self.cam_combo.setEnabled(True)
-        self.res_combo.setEnabled(True)
+        self.port_combo.setEnabled(True)
+        self.baud_combo.setEnabled(True)
         self.fps_lbl.setText("FPS: —")
         self.res_lbl.setText("")
-        self.view.setText("No camera — press Start")
-        self.log_message.emit("[Camera] Stopped.")
+        self.view.setPixmap(QPixmap())
+        self.view.setText("Select the device COM port and press Start")
+        self.log_message.emit("[Camera] Disconnected.")
 
     def _on_frame(self, img: QImage):
         self._last_frame = img
